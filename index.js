@@ -139,7 +139,7 @@ ${icon} Entry: ${fmtNum(data.entry)}
 🙅‍♂️ Stop-Loss: ${fmtNum(data.sl)}
 🪙 Tỉ lệ RR: ${data.rr || '-'} (Conf: ${conf})
 
-🧠 By Bot [AI TRADING V3/AI RSI]
+🧠 By AI TRADING V4s
 
 ⚠️ Nhất định phải tuân thủ quản lý rủi ro – Đi tối đa 2-3% risk, Bot chỉ để tham khảo, win 3 lệnh nên ngưng`;
 
@@ -307,7 +307,7 @@ bot.onText(/\/start/, async (msg) => {
         await saveUsers(users);
 
         const welcome = `👋 Chào ${user.first_name || 'Trader'}!\n\n` +
-            `Bạn đã được đăng ký nhận tín hiệu tự động từ AI Trading Bot V3.\n` +
+            `Bạn đã được đăng ký nhận tín hiệu tự động từ AI Trading Bot V4s.\n` +
             `Chỉ cần giữ bot và chờ tín hiệu. Nếu muốn phân tích thủ công, dùng /analyzesymbol SYMBOL\n\n` +
             `⚠️ Bot chỉ gửi tín hiệu tham khảo — luôn tuân thủ quản lý rủi ro.`;
 

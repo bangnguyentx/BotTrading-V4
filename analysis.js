@@ -1,517 +1,336 @@
+// analysis.js
+// Physics Momentum analyzer + multi-source candle loader + helper check for TP/SL
+// Trả về object signal khi detect (entry, tp, sl, rr, side, confidence)
+// Cũng export checkSignalHit để monitor signal (kiểm tra nếu TP/SL đã bị chạm trong nến 1m)
+
 const axios = require('axios');
 
-// --- MULTIPLE DATA SOURCES (giữ nguyên các nguồn bạn đã cung cấp) ---
 const DATA_SOURCES = [
     {
         name: 'Binance Main',
         klines: (symbol, interval, limit = 500) =>
-            `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+            `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
         priority: 1
     },
     {
-        name: 'Binance Backup 1',
+        name: 'Binance Futures (fapi) fallback',
         klines: (symbol, interval, limit = 500) =>
-            `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
+            `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
         priority: 2
     },
     {
         name: 'Bybit Backup',
         klines: (symbol, interval, limit = 500) => {
-            const mapping = { '1d': 'D', '4h': '240', '1h': '60', '15m': '15' };
-            return `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${mapping[interval] || '60'}&limit=${limit}`;
+            // Bybit v5 mapping
+            const mapping = { '1m': '1', '15m': '15', '1h': '60', '4h': '240', '1d': 'D' };
+            const intv = mapping[interval] || mapping['1m'];
+            return `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${intv}&limit=${limit}`;
         },
         priority: 3
     }
 ];
 
-// TIMEFRAMES (giữ nguyên)
-const TIMEFRAMES = [
-    { label: 'D1', interval: '1d', weight: 1.5 },
-    { label: 'H4', interval: '4h', weight: 1.3 },
-    { label: 'H1', interval: '1h', weight: 1.1 },
-    { label: '15M', interval: '15m', weight: 0.8 }
-];
+// Physics Momentum parameters
+const RSI_LENGTH = 14;
+const BB_LENGTH = 20;
+const BB_STD = 2;
+const V_SMA = 3; // velocity SMA length
+const ATR_LENGTH = 14;
 
-// --- Smart candle loader with fallback ---
-async function loadCandles(symbol, interval, limit = 500) {
-    const sources = [...DATA_SOURCES].sort((a,b)=>a.priority - b.priority);
+const fetchTimeout = 10000; // ms
+
+async function loadCandles(symbol, interval = '5m', limit = 120) {
+    // Try sources in order of priority; shuffle only if you want random rotation.
+    const sources = DATA_SOURCES.slice().sort((a, b) => a.priority - b.priority);
+
     for (const source of sources) {
         try {
-            // Build url & fetch
             const url = source.klines(symbol, interval, limit);
-            const response = await axios.get(url, {
-                timeout: 10000,
+            const res = await axios.get(url, {
+                timeout: fetchTimeout,
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (compatible; NemesisBot/1.0)',
                     'Accept': 'application/json'
                 }
             });
-            if (response.status === 200 && response.data) {
-                let candles;
-                if (source.name.includes('Bybit')) {
-                    if (response.data && response.data.result && response.data.result.list) {
-                        candles = response.data.result.list.map(c => ({
-                            open: parseFloat(c[1]),
-                            high: parseFloat(c[2]),
-                            low: parseFloat(c[3]),
-                            close: parseFloat(c[4]),
-                            vol: parseFloat(c[5]),
-                            t: parseFloat(c[0])
-                        })).reverse();
-                    } else {
-                        throw new Error('Invalid Bybit response format');
-                    }
-                } else {
-                    // Binance style array
-                    candles = response.data.map(c => ({
-                        open: parseFloat(c[1]),
-                        high: parseFloat(c[2]),
-                        low: parseFloat(c[3]),
-                        close: parseFloat(c[4]),
-                        vol: parseFloat(c[5]),
-                        t: c[0]
-                    }));
-                }
-                if (candles && candles.length > 0) {
-                    return candles;
-                }
+
+            if (res.status !== 200 || !res.data) {
+                continue;
             }
-        } catch (e) {
-            console.warn(`${source.name} failed for ${symbol} ${interval}: ${e.response?.status || e.code || ''} ${e.message}`);
-            // if rate limit, wait a bit
-            if (e.response && (e.response.status === 418 || e.response.status === 429)) {
-                await new Promise(r => setTimeout(r, 4000));
+
+            let raw = res.data;
+
+            // Normalize formats
+            let candles = [];
+            if (source.name.includes('Bybit')) {
+                // Bybit structure: response.data.result.list (may vary)
+                const list = raw?.result?.list || raw?.result?.data || raw;
+                if (!list) throw new Error('Invalid Bybit response format');
+                // bybit list might be newest-first; ensure consistent mapping
+                // We map into array of { t, open, high, low, close, vol } in ascending time
+                const mapped = list.map(item => {
+                    // item structure might be [t, open, high, low, close, vol] OR object - try both
+                    if (Array.isArray(item)) {
+                        return {
+                            t: parseInt(item[0]),
+                            open: parseFloat(item[1]),
+                            high: parseFloat(item[2]),
+                            low: parseFloat(item[3]),
+                            close: parseFloat(item[4]),
+                            vol: parseFloat(item[5] || 0)
+                        };
+                    } else {
+                        // object with keys
+                        return {
+                            t: parseInt(item.t || item.start || 0),
+                            open: parseFloat(item.o || item.open || 0),
+                            high: parseFloat(item.h || item.high || 0),
+                            low: parseFloat(item.l || item.low || 0),
+                            close: parseFloat(item.c || item.close || 0),
+                            vol: parseFloat(item.v || item.volume || 0)
+                        };
+                    }
+                });
+                // ensure ascending by time
+                candles = mapped.sort((a, b) => a.t - b.t);
+            } else {
+                // Binance style: array of arrays [openTime, open, high, low, close, volume, ...]
+                if (!Array.isArray(raw)) throw new Error('Invalid Binance response format');
+                candles = raw.map(item => ({
+                    t: parseInt(item[0]),
+                    open: parseFloat(item[1]),
+                    high: parseFloat(item[2]),
+                    low: parseFloat(item[3]),
+                    close: parseFloat(item[4]),
+                    vol: parseFloat(item[5] || 0)
+                }));
+            }
+
+            if (candles.length === 0) continue;
+            return candles;
+        } catch (err) {
+            // Log and continue to next source
+            console.log(`❌ ${source.name} failed for ${symbol} ${interval}: ${err?.response?.status || err.code || err.message}`);
+            // If rate-limited, small backoff
+            if (err?.response?.status === 418 || err?.response?.status === 429) {
+                await new Promise(r => setTimeout(r, 3000));
             }
             continue;
         }
     }
-    throw new Error(`All sources failed for ${symbol} ${interval}`);
+
+    throw new Error(`All data sources failed for ${symbol} ${interval}`);
 }
 
-// --- INDICATOR & ANALYSIS HELPERS (kept original functions, with try/catch where appropriate) ---
-function calculateATR(candles, period = 14) {
-    try {
-        if (!candles || candles.length < period + 1) return 0;
-        const trValues = [];
-        for (let i = 1; i < candles.length; i++) {
-            const tr = Math.max(
-                candles[i].high - candles[i].low,
-                Math.abs(candles[i].high - candles[i - 1].close),
-                Math.abs(candles[i].low - candles[i - 1].close)
-            );
-            trValues.push(tr);
-        }
-        let atr = trValues.slice(0, period).reduce((a, b) => a + b, 0) / period;
-        for (let i = period; i < trValues.length; i++) {
-            atr = (atr * (period - 1) + trValues[i]) / period;
-        }
-        return atr;
-    } catch (e) {
-        return 0;
+// Helpers: simple RSI, SMA, ATR implementations on arrays
+function rsiFromCloses(closes, length = 14) {
+    // returns array of RSI values aligned with closes (NaN for first)
+    const res = new Array(closes.length).fill(NaN);
+    if (closes.length < length + 1) return res;
+    // compute deltas
+    const deltas = [];
+    for (let i = 1; i < closes.length; i++) deltas.push(closes[i] - closes[i - 1]);
+    // initial avg gain/loss
+    let gains = 0, losses = 0;
+    for (let i = 0; i < length; i++) {
+        const d = deltas[i];
+        if (d > 0) gains += d; else losses += Math.abs(d);
     }
-}
-
-function isSwingHigh(highs, index, lookback = 3) {
-    for (let i = 1; i <= lookback; i++) {
-        if (index - i >= 0 && highs[index] <= highs[index - i]) return false;
-        if (index + i < highs.length && highs[index] <= highs[index + i]) return false;
+    let avgGain = gains / length;
+    let avgLoss = losses / length;
+    let rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    res[length] = 100 - (100 / (1 + rs));
+    for (let i = length + 1; i < closes.length; i++) {
+        const d = deltas[i - 1];
+        const gain = d > 0 ? d : 0;
+        const loss = d < 0 ? Math.abs(d) : 0;
+        avgGain = (avgGain * (length - 1) + gain) / length;
+        avgLoss = (avgLoss * (length - 1) + loss) / length;
+        rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+        res[i] = 100 - (100 / (1 + rs));
     }
-    return true;
+    return res;
 }
 
-function isSwingLow(lows, index, lookback = 3) {
-    for (let i = 1; i <= lookback; i++) {
-        if (index - i >= 0 && lows[index] >= lows[index - i]) return false;
-        if (index + i < lows.length && lows[index] >= lows[index + i]) return false;
+function sma(values, period) {
+    const out = new Array(values.length).fill(NaN);
+    let sum = 0;
+    for (let i = 0; i < values.length; i++) {
+        sum += values[i] || 0;
+        if (i >= period) sum -= values[i - period] || 0;
+        if (i >= period - 1) out[i] = sum / period;
     }
-    return true;
+    return out;
 }
 
-function analyzeAdvancedMarketStructure(candles) {
-    if (!candles || candles.length < 10) return { swingHighs: [], swingLows: [], trend: 'neutral', breakOfStructure: false, changeOfCharacter: false };
-    const highs = candles.map(c => c.high);
-    const lows = candles.map(c => c.low);
-    const structure = { swingHighs: [], swingLows: [], trend: 'neutral', breakOfStructure: false, changeOfCharacter: false };
-
-    for (let i = 3; i < candles.length - 3; i++) {
-        if (isSwingHigh(highs, i)) structure.swingHighs.push({ index: i, price: highs[i], time: candles[i].t });
-        if (isSwingLow(lows, i)) structure.swingLows.push({ index: i, price: lows[i], time: candles[i].t });
+function atrFromCandles(candles, period = 14) {
+    const trs = [];
+    for (let i = 1; i < candles.length; i++) {
+        const cur = candles[i];
+        const prev = candles[i - 1];
+        const tr = Math.max(
+            cur.high - cur.low,
+            Math.abs(cur.high - prev.close),
+            Math.abs(cur.low - prev.close)
+        );
+        trs.push(tr);
     }
-
-    if (structure.swingHighs.length >= 2 && structure.swingLows.length >= 2) {
-        const rh = structure.swingHighs.slice(-2);
-        const rl = structure.swingLows.slice(-2);
-        if (rh[1].price > rh[0].price && rl[1].price > rl[0].price) structure.trend = 'bullish';
-        else if (rh[1].price < rh[0].price && rl[1].price < rl[0].price) structure.trend = 'bearish';
+    if (trs.length < period) return new Array(candles.length).fill(NaN);
+    const out = new Array(candles.length).fill(NaN);
+    let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    out[period] = atr;
+    for (let i = period; i < trs.length; i++) {
+        atr = (atr * (period - 1) + trs[i]) / period;
+        out[i + 1] = atr; // offset by 1 due to trs indexing
     }
-
-    structure.breakOfStructure = detectBreakOfStructure(structure);
-    structure.changeOfCharacter = detectChangeOfCharacter(structure);
-    return structure;
+    return out;
 }
 
-function detectBreakOfStructure(structure) {
-    if (structure.swingHighs.length < 3 || structure.swingLows.length < 3) return false;
-    const recentHighs = structure.swingHighs.slice(-3);
-    const recentLows = structure.swingLows.slice(-3);
-    if (structure.trend === 'bullish') return recentHighs[2].price > recentHighs[1].price && recentHighs[1].price > recentHighs[0].price;
-    if (structure.trend === 'bearish') return recentLows[2].price < recentLows[1].price && recentLows[1].price < recentLows[0].price;
-    return false;
-}
-
-function detectChangeOfCharacter(structure) {
-    if (structure.swingHighs.length < 3 || structure.swingLows.length < 3) return false;
-    const recentHighs = structure.swingHighs.slice(-3);
-    const recentLows = structure.swingLows.slice(-3);
-    if (structure.trend === 'bullish') return recentLows[2].price > recentLows[1].price && recentLows[1].price < recentLows[0].price;
-    if (structure.trend === 'bearish') return recentHighs[2].price < recentHighs[1].price && recentHighs[1].price > recentHighs[0].price;
-    return false;
-}
-
-function findOrderBlocks(candles) {
-    if (!candles || candles.length < 3) return [];
-    const blocks = [];
-    for (let i = 1; i < candles.length - 1; i++) {
-        const current = candles[i], next = candles[i+1];
-        if (current.close < current.open && next.close < next.open &&
-            Math.abs(next.close - next.open) > Math.abs(current.close - current.open) * 1.5) {
-            blocks.push({ type: 'bearish', high: current.high, low: current.low, time: current.t, strength: 0.7 });
-        }
-        if (current.close > current.open && next.close > next.open &&
-            Math.abs(next.close - next.open) > Math.abs(current.close - current.open) * 1.5) {
-            blocks.push({ type: 'bullish', high: current.high, low: current.low, time: current.t, strength: 0.7 });
-        }
-    }
-    return blocks.slice(-10);
-}
-
-function findFairValueGaps(candles) {
-    if (!candles || candles.length < 3) return [];
-    const gaps = [];
-    for (let i = 1; i < candles.length - 1; i++) {
-        const prev = candles[i-1], curr = candles[i], next = candles[i+1];
-        if (curr.low > Math.max(prev.high, next.high)) gaps.push({ type: 'bullish', high: Math.min(prev.low, next.low), low: curr.high, time: curr.t, strength: 0.6 });
-        if (curr.high < Math.min(prev.low, next.low)) gaps.push({ type: 'bearish', high: curr.low, low: Math.max(prev.high, next.high), time: curr.t, strength: 0.6 });
-    }
-    return gaps.slice(-8);
-}
-
-function analyzeVolumeProfile(candles) {
-    if (!candles || candles.length === 0) return { poc: 0, totalVolume: 0, averageVolume: 0, volumeDelta: 1 };
-    const volumeByPrice = {};
-    let totalVolume = 0;
-    candles.forEach(c => {
-        const range = c.high - c.low;
-        if (range === 0) return;
-        const step = range / 10;
-        for (let i = 0; i < 10; i++) {
-            const priceLevel = (c.low + step * i).toFixed(2);
-            volumeByPrice[priceLevel] = (volumeByPrice[priceLevel] || 0) + (c.vol / 10);
-        }
-        totalVolume += c.vol;
-    });
-    let poc = 0, maxVolume = 0;
-    for (const [price, volume] of Object.entries(volumeByPrice)) {
-        if (volume > maxVolume) { maxVolume = volume; poc = parseFloat(price); }
-    }
-    return { poc, totalVolume, averageVolume: totalVolume / candles.length, volumeDelta: calculateVolumeDelta(candles) };
-}
-
-function calculateVolumeDelta(candles) {
-    if (!candles || candles.length < 20) return 1;
-    const recent = candles.slice(-5).reduce((s,c)=>s+c.vol,0)/5;
-    const older = candles.slice(-20,-5).reduce((s,c)=>s+c.vol,0)/15;
-    return older === 0 ? 1 : recent/older;
-}
-
-function findLiquidityLevels(candles) {
-    if (!candles || candles.length < 10) return [];
-    const levels = [];
-    const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
-    for (let i = 5; i < candles.length - 5; i++) {
-        if (isSwingHigh(highs, i, 2)) levels.push({ type: 'resistance', price: highs[i], time: candles[i].t, strength: 'strong' });
-        if (isSwingLow(lows, i, 2)) levels.push({ type: 'support', price: lows[i], time: candles[i].t, strength: 'strong' });
-    }
-    return levels.slice(-6);
-}
-
-function analyzeTimeframeICT(candles, timeframe) {
-    if (!candles || candles.length === 0) return null;
-    const price = candles[candles.length - 1].close;
-    const ms = analyzeAdvancedMarketStructure(candles);
-    const obs = findOrderBlocks(candles);
-    const fvg = findFairValueGaps(candles);
-    const vol = analyzeVolumeProfile(candles);
-    const liquidity = findLiquidityLevels(candles);
-    const atr = calculateATR(candles);
-    return {
-        price,
-        trend: ms.trend,
-        strength: calculateTrendStrength(ms),
-        marketStructure: ms,
-        orderBlocks: filterRelevantLevels(obs, price),
-        fairValueGaps: filterRelevantLevels(fvg, price),
-        volumeAnalysis: vol,
-        liquidityLevels: filterRelevantLevels(liquidity, price),
-        atr,
-        confidence: calculateTimeframeConfidence(ms, vol, obs.length)
-    };
-}
-
-function calculateTrendStrength(marketStructure) {
-    if (!marketStructure || marketStructure.swingHighs.length < 2 || marketStructure.swingLows.length < 2) return 0;
-    const rh = marketStructure.swingHighs.slice(-2), rl = marketStructure.swingLows.slice(-2);
-    const highSlope = (rh[1].price - rh[0].price) / (rh[1].index - rh[0].index);
-    const lowSlope = (rl[1].price - rl[0].price) / (rl[1].index - rl[0].index);
-    return Math.abs(highSlope + lowSlope) / 2;
-}
-
-function filterRelevantLevels(levels, currentPrice) {
-    if (!levels || levels.length === 0) return [];
-    return levels.filter(l => Math.abs(l.price - currentPrice) / currentPrice < 0.05);
-}
-
-function calculateTimeframeConfidence(marketStructure, volumeAnalysis, obCount) {
-    let confidence = 50;
-    if (marketStructure.trend !== 'neutral') confidence += 20;
-    if (volumeAnalysis.volumeDelta > 1.2) confidence += 15;
-    if (obCount > 0) confidence += 10;
-    return Math.min(95, confidence);
-}
-
-function calculateRealConfidence(results) {
-    let totalScore = 0, maxScore = 0;
-    for (const [tf, data] of Object.entries(results.timeframes)) {
-        if (!data.analysis) continue;
-        const weight = getTimeframeWeight(tf);
-        const tfScore = calculateTFScoreICT(data.analysis);
-        totalScore += tfScore * weight;
-        maxScore += 100 * weight;
-    }
-    if (maxScore === 0) return 0;
-    const confluenceBonus = calculateConfluenceBonus(results);
-    totalScore += confluenceBonus;
-    return Math.min(100, (totalScore / maxScore) * 100);
-}
-
-function getTimeframeWeight(tf) {
-    const weights = { 'D1': 1.5, 'H4': 1.3, 'H1': 1.1, '15M': 0.8 };
-    return weights[tf] || 1.0;
-}
-
-function calculateTFScoreICT(analysis) {
-    if (!analysis) return 0;
-    let score = 0;
-    score += analysis.marketStructure.trend !== 'neutral' ? 25 : 0;
-    score += analysis.marketStructure.breakOfStructure ? 15 : 0;
-    score += analysis.marketStructure.changeOfCharacter ? 8 : 0;
-    if (analysis.volumeAnalysis.volumeDelta) score += Math.min(30, (analysis.volumeAnalysis.volumeDelta - 1) * 60);
-    score += Math.min(25, analysis.orderBlocks.length * 4);
-    score += Math.min(20, analysis.fairValueGaps.length * 3);
-    if (analysis.liquidityLevels.length > 0) {
-        score += 15;
-        const nearLiquidity = analysis.liquidityLevels.some(level => Math.abs(analysis.price - level.price) < analysis.atr * 0.5);
-        if (nearLiquidity) score += 15;
-    }
-    return Math.min(100, score);
-}
-
-function calculateConfluenceBonus(results) {
-    let bonus = 0;
-    const timeframes = Object.values(results.timeframes).filter(tf => tf.analysis);
-    const bullishSignals = timeframes.filter(tf => tf.analysis.trend === 'bullish' && tf.analysis.orderBlocks.some(ob => ob.type === 'bullish')).length;
-    const bearishSignals = timeframes.filter(tf => tf.analysis.trend === 'bearish' && tf.analysis.orderBlocks.some(ob => ob.type === 'bearish')).length;
-    const confluence = Math.max(bullishSignals, bearishSignals);
-    bonus = confluence * 8;
-    return Math.min(30, bonus);
-}
-
-function calculateMultiTFBias(timeframes) {
-    let bias = 0;
-    timeframes.forEach((tf, index) => {
-        if (!tf.analysis) return;
-        const weight = TIMEFRAMES[index].weight;
-        const analysis = tf.analysis;
-        if (analysis.trend === 'bullish') bias += weight;
-        else if (analysis.trend === 'bearish') bias -= weight;
-        if (analysis.marketStructure.breakOfStructure) {
-            if (analysis.marketStructure.trend === 'bullish') bias += weight * 0.5;
-            else if (analysis.marketStructure.trend === 'bearish') bias -= weight * 0.5;
-        }
-    });
-    return bias;
-}
-
-function findOptimalLongEntry(currentPrice, analysis, multiTimeframeAnalysis) {
-    const relevantOBs = analysis.orderBlocks.filter(ob => ob.type === 'bullish' && currentPrice > ob.low && currentPrice < ob.high * 1.02);
-    if (relevantOBs.length > 0) {
-        const bestOB = relevantOBs.reduce((best, cur) => cur.strength > best.strength ? cur : best);
-        return bestOB.low * 0.998;
-    }
-    const relevantFVGs = analysis.fairValueGaps.filter(fvg => fvg.type === 'bullish' && currentPrice > fvg.low && currentPrice < fvg.high);
-    if (relevantFVGs.length > 0) {
-        const bestFVG = relevantFVGs[0];
-        return Math.max(bestFVG.low, currentPrice * 0.995);
-    }
-    const supports = analysis.liquidityLevels.filter(l => l.type === 'support').map(l=>l.price).filter(p=>p<currentPrice).sort((a,b)=>b-a);
-    if (supports.length>0) return supports[0]*1.001;
-    return currentPrice*0.998;
-}
-
-function findOptimalShortEntry(currentPrice, analysis, multiTimeframeAnalysis) {
-    const relevantOBs = analysis.orderBlocks.filter(ob => ob.type === 'bearish' && currentPrice < ob.high && currentPrice > ob.low * 0.98);
-    if (relevantOBs.length > 0) {
-        const bestOB = relevantOBs.reduce((best, cur) => cur.strength > best.strength ? cur : best);
-        return bestOB.high * 1.002;
-    }
-    const relevantFVGs = analysis.fairValueGaps.filter(fvg => fvg.type === 'bearish' && currentPrice < fvg.high && currentPrice > fvg.low);
-    if (relevantFVGs.length > 0) {
-        const bestFVG = relevantFVGs[0];
-        return Math.min(bestFVG.high, currentPrice * 1.005);
-    }
-    const resistances = analysis.liquidityLevels.filter(l => l.type === 'resistance').map(l=>l.price).filter(p=>p>currentPrice).sort((a,b)=>a-b);
-    if (resistances.length>0) return resistances[0]*0.999;
-    return currentPrice*1.002;
-}
-
-function calculateSmartStopLoss(entry, direction, analysis, multiTimeframeAnalysis) {
-    const atr = analysis.atr || 0.0001;
-    if (direction === 'LONG') {
-        const supports = analysis.liquidityLevels.filter(l => l.type === 'support').map(l=>l.price).filter(price => price < entry && price >= entry - (atr * 1.5)).sort((a,b)=>b-a);
-        if (supports.length>0) {
-            const nearestSupport = supports[0];
-            const atrBasedSL = entry - (atr * 0.6);
-            return Math.min(nearestSupport, atrBasedSL);
-        }
-        return entry - (atr * 0.8);
-    } else {
-        const resistances = analysis.liquidityLevels.filter(l => l.type === 'resistance').map(l=>l.price).filter(price => price > entry && price <= entry + (atr * 1.5)).sort((a,b)=>a-b);
-        if (resistances.length>0) {
-            const nearestResistance = resistances[0];
-            const atrBasedSL = entry + (atr * 0.6);
-            return Math.max(nearestResistance, atrBasedSL);
-        }
-        return entry + (atr * 0.8);
-    }
-}
-
-function calculateSmartTakeProfit(entry, sl, direction, analysis, multiTimeframeAnalysis) {
-    const risk = Math.abs(entry - sl);
-    const atr = analysis.atr || Math.max( Math.abs(entry*0.01), 0.0001 );
-    if (direction === 'LONG') {
-        const nearbyResistances = analysis.liquidityLevels.filter(l => l.type === 'resistance').map(l=>l.price).filter(p => p > entry && p <= entry + (atr*1.2)).sort((a,b)=>a-b);
-        let tp = nearbyResistances.length>0 ? nearbyResistances[0] : entry + (atr*0.8);
-        const minTP = entry + risk * 1.2;
-        const maxTP = entry + risk * 2.0;
-        tp = Math.max(tp, minTP);
-        tp = Math.min(tp, maxTP);
-        return tp;
-    } else {
-        const nearbySupports = analysis.liquidityLevels.filter(l => l.type === 'support').map(l=>l.price).filter(p => p < entry && p >= entry - (atr*1.2)).sort((a,b)=>b-a);
-        let tp = nearbySupports.length>0 ? nearbySupports[0] : entry - (atr*0.8);
-        const minTP = entry - risk * 1.2;
-        const maxTP = entry - risk * 2.0;
-        tp = Math.min(tp, minTP);
-        tp = Math.max(tp, maxTP);
-        return tp;
-    }
-}
-
-function validateLevels(entry, sl, tp, currentPrice, atr) {
-    const maxDistance = atr * 2.5;
-    if (Math.abs(entry - sl) > maxDistance) {
-        if (entry > sl) sl = entry - (atr * 1.0); else sl = entry + (atr * 1.0);
-    }
-    if (Math.abs(entry - tp) > maxDistance) {
-        if (entry < tp) tp = entry + (atr * 1.5); else tp = entry - (atr * 1.5);
-    }
-    const rr = Math.abs(tp - entry) / Math.abs(entry - sl);
-    let adjustedTp = tp;
-    if (rr < 0.8) adjustedTp = entry + (entry - sl) * 1.0;
-    else if (rr > 3.0) adjustedTp = entry + (entry - sl) * 2.0;
-    return { entry, sl, tp: adjustedTp, rr: rr.toFixed(2) };
-}
-
-function calculateSmartLevels(direction, currentPrice, analysis, multiTimeframeAnalysis) {
-    const atr = analysis.atr || 0.0001;
-    if (direction === 'LONG') {
-        const entry = findOptimalLongEntry(currentPrice, analysis, multiTimeframeAnalysis);
-        const sl = calculateSmartStopLoss(entry, direction, analysis, multiTimeframeAnalysis);
-        const tp = calculateSmartTakeProfit(entry, sl, direction, analysis, multiTimeframeAnalysis);
-        const validated = validateLevels(entry, sl, tp, currentPrice, atr);
-        return { entry: validated.entry, sl: validated.sl, tp: validated.tp, rr: validated.rr };
-    } else {
-        const entry = findOptimalShortEntry(currentPrice, analysis, multiTimeframeAnalysis);
-        const sl = calculateSmartStopLoss(entry, direction, analysis, multiTimeframeAnalysis);
-        const tp = calculateSmartTakeProfit(entry, sl, direction, analysis, multiTimeframeAnalysis);
-        const validated = validateLevels(entry, sl, tp, currentPrice, atr);
-        return { entry: validated.entry, sl: validated.sl, tp: validated.tp, rr: validated.rr };
-    }
-}
-
-function calculatePositionSize(riskPercent, accountBalance, entry, sl, direction) {
-    const riskAmount = accountBalance * (riskPercent / 100);
-    const riskPerUnit = Math.abs(entry - sl);
-    const size = riskPerUnit === 0 ? 0 : (riskAmount / riskPerUnit).toFixed(4);
-    return { size: size, maxLoss: riskAmount.toFixed(2) };
-}
-
-// --- MAIN exported analyzeSymbol (keeps original overall flow, with try/catch) ---
+// Main Physics Momentum analyzer
 async function analyzeSymbol(symbol) {
     try {
-        const results = { timeframes: {}, marketStructure: {}, volumeAnalysis: {}, signals: {}, ictConcepts: {} };
-
-        for (const tf of TIMEFRAMES) {
-            try {
-                const candles = await loadCandles(symbol, tf.interval, 300);
-                if (candles && candles.length > 0) {
-                    results.timeframes[tf.label] = { candles, price: candles[candles.length-1].close, analysis: analyzeTimeframeICT(candles, tf.label) };
-                }
-            } catch (e) {
-                console.warn(`⚠️ Skip TF ${tf.label} for ${symbol}: ${e.message}`);
-            }
+        const ohlcv = await loadCandles(symbol, '5m', 200);
+        if (!ohlcv || ohlcv.length < 30) {
+            return null;
         }
 
-        const tfs = Object.values(results.timeframes);
-        if (tfs.length === 0) {
-            return { symbol, direction: 'NO_TRADE', confidence: 0, reason: 'No data' };
+        const closes = ohlcv.map(c => c.close);
+        const highs = ohlcv.map(c => c.high);
+        const lows = ohlcv.map(c => c.low);
+
+        // RSI
+        const rsiArr = rsiFromCloses(closes, RSI_LENGTH);
+
+        // Bollinger Bands - simple implementation using SMA & stdDev
+        const sma20 = sma(closes, BB_LENGTH);
+        const bb_upper = new Array(closes.length).fill(NaN);
+        const bb_lower = new Array(closes.length).fill(NaN);
+        for (let i = BB_LENGTH - 1; i < closes.length; i++) {
+            const slice = closes.slice(i - BB_LENGTH + 1, i + 1);
+            const mean = sma20[i];
+            let variance = 0;
+            for (const v of slice) variance += Math.pow(v - mean, 2);
+            variance /= BB_LENGTH;
+            const std = Math.sqrt(variance);
+            bb_upper[i] = mean + BB_STD * std;
+            bb_lower[i] = mean - BB_STD * std;
         }
 
-        const currentPrice = tfs[0].price;
-        const bias = calculateMultiTFBias(tfs);
-        const confidence = Math.round(calculateRealConfidence(results));
+        // Velocity v = SMA(3) of price change
+        const priceChange = new Array(closes.length).fill(0);
+        for (let i = 1; i < closes.length; i++) priceChange[i] = closes[i] - closes[i - 1];
+        const vArr = sma(priceChange, V_SMA);
 
-        if (confidence < 60) {
-            return { symbol, direction: 'NO_TRADE', confidence, reason: `Confidence ${confidence}% < 60%` };
+        // Acceleration a = v_t - v_{t-1}
+        const aArr = new Array(vArr.length).fill(NaN);
+        for (let i = 1; i < vArr.length; i++) {
+            if (!isNaN(vArr[i]) && !isNaN(vArr[i - 1])) aArr[i] = vArr[i] - vArr[i - 1];
         }
 
-        const direction = bias > 0.5 ? 'LONG' : bias < -0.5 ? 'SHORT' : 'NEUTRAL';
-        if (direction === 'NEUTRAL') {
-            return { symbol, direction: 'NEUTRAL', confidence, reason: 'No clear bias' };
+        // ATR
+        const atrArr = atrFromCandles(ohlcv, ATR_LENGTH);
+
+        const i = closes.length - 1;
+        const rsi = rsiArr[i];
+        const close = closes[i];
+        const lowerBB = bb_lower[i];
+        const upperBB = bb_upper[i];
+        const acc = aArr[i];
+        const atr = atrArr[i];
+
+        if ([rsi, lowerBB, upperBB, acc, atr].some(v => v === undefined || v === null || isNaN(v))) {
+            return null;
         }
 
-        const primary = tfs.find(tf => tf.analysis && tf.analysis.confidence > 70) || tfs[0];
-        if (!primary.analysis) return { symbol, direction: 'NO_TRADE', confidence: 0, reason: 'No valid primary analysis' };
+        // Entry rules
+        let side = null;
+        if (rsi < 30 && close < lowerBB && acc > 0) side = 'LONG';
+        else if (rsi > 70 && close > upperBB && acc < 0) side = 'SHORT';
+        else return null;
 
-        const levels = calculateSmartLevels(direction, currentPrice, primary.analysis, results);
-        const pos = calculatePositionSize(2, 1000, parseFloat(levels.entry), parseFloat(levels.sl), direction);
+        const entry = close;
+        let sl, tp;
+        if (side === 'LONG') {
+            sl = entry - 1.5 * atr;
+            tp = entry + 3.0 * atr;
+        } else {
+            sl = entry + 1.5 * atr;
+            tp = entry - 3.0 * atr;
+        }
+
+        const rr = Math.abs(tp - entry) / Math.abs(entry - sl);
+        const confidence = 60 + Math.min(35, Math.max(0, (Math.abs(acc) / (Math.abs(atr) || 1)) * 10)); // heuristic
 
         return {
             symbol,
-            direction,
-            confidence,
-            entry: parseFloat(levels.entry).toFixed(4),
-            sl: parseFloat(levels.sl).toFixed(4),
-            tp: parseFloat(levels.tp).toFixed(4),
-            rr: levels.rr,
-            positionSize: pos.size,
-            maxLoss: pos.maxLoss
+            side,
+            entry: parseFloat(entry.toFixed(8)),
+            sl: parseFloat(sl.toFixed(8)),
+            tp: parseFloat(tp.toFixed(8)),
+            rr: parseFloat(rr.toFixed(2)),
+            confidence: Math.round(Math.min(100, confidence)),
+            meta: {
+                rsi: parseFloat(rsi.toFixed(2)),
+                acc: parseFloat(acc.toFixed(8)),
+                atr: parseFloat(atr.toFixed(8)),
+                lowerBB: parseFloat(lowerBB.toFixed(8)),
+                upperBB: parseFloat(upperBB.toFixed(8)),
+                timeframe: '5m'
+            }
         };
-
-    } catch (e) {
-        console.error(`Analysis error for ${symbol}:`, e.message);
-        return { symbol, direction: 'NO_TRADE', confidence: 0, reason: `Analysis error: ${e.message}` };
+    } catch (err) {
+        console.error(`analysis.analyzeSymbol error for ${symbol}:`, err.message || err);
+        return null;
     }
 }
 
-module.exports = { analyzeSymbol };
+// Function for monitor: check if TP/SL hit using 1m candles
+// returns { status: 'TP'|'SL' | null, whichCandleIndex: idx (0..n-1), detail: {...} }
+async function checkSignalHit(symbol, side, entry, sl, tp, lookbackMinutes = 120) {
+    try {
+        // load last lookbackMinutes of 1m candles (limit = lookbackMinutes)
+        const limit = Math.min(Math.max(lookbackMinutes, 10), 1440); // 10..1440
+        const candles = await loadCandles(symbol, '1m', limit);
+        if (!candles || candles.length === 0) return { status: null };
+
+        // iterate from old to new, find the earliest candle where SL or TP touched
+        for (let idx = 0; idx < candles.length; idx++) {
+            const c = candles[idx];
+            const high = c.high;
+            const low = c.low;
+            const open = c.open;
+            const close = c.close;
+
+            if (side === 'LONG') {
+                const tpTouched = high >= tp;
+                const slTouched = low <= sl;
+                if (tpTouched && !slTouched) return { status: 'TP', idx, candle: c };
+                if (slTouched && !tpTouched) return { status: 'SL', idx, candle: c };
+                if (tpTouched && slTouched) {
+                    // both touched in same candle - best-effort decide by close price:
+                    if (close >= tp) return { status: 'TP', idx, candle: c, note: 'both_in_same_candle, close>=tp => TP' };
+                    else return { status: 'SL', idx, candle: c, note: 'both_in_same_candle, close<tp => SL' };
+                }
+            } else if (side === 'SHORT') {
+                const tpTouched = low <= tp;
+                const slTouched = high >= sl;
+                if (tpTouched && !slTouched) return { status: 'TP', idx, candle: c };
+                if (slTouched && !tpTouched) return { status: 'SL', idx, candle: c };
+                if (tpTouched && slTouched) {
+                    if (close <= tp) return { status: 'TP', idx, candle: c, note: 'both_in_same_candle, close<=tp => TP' };
+                    else return { status: 'SL', idx, candle: c, note: 'both_in_same_candle, close>tp => SL' };
+                }
+            }
+        }
+
+        return { status: null };
+    } catch (err) {
+        console.error(`analysis.checkSignalHit error for ${symbol}:`, err.message || err);
+        return { status: null };
+    }
+}
+
+module.exports = {
+    analyzeSymbol,
+    checkSignalHit
+};
